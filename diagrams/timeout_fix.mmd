@@ -1,0 +1,16 @@
+flowchart TD
+    A[Webhook Receives Lead] --> B[Validate Basic Payload]
+    B --> C[Save Raw Lead status=PENDING]
+    C --> D[Return 200 OK Quickly]
+    C --> E[Queue Background Job]
+    E --> F[OpenAI Scoring]
+    F --> G{Success?}
+    G -->|Yes| H[Save AI Score]
+    H --> I[Send / Update HubSpot]
+    I --> J[Mark COMPLETED]
+    G -->|Timeout| K[Retry with Exponential Backoff]
+    K --> F
+    G -->|Rate Limit| L[Wait + Retry]
+    L --> F
+    G -->|Failed After Retries| M[Dead Letter Queue]
+    M --> N[Alert Ops Team]

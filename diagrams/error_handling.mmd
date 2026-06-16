@@ -1,0 +1,17 @@
+flowchart TD
+    A[XRPL API Call] --> B{Success?}
+    B -->|Yes| C[Validate Response]
+    C --> D[Save CSV Output]
+    D --> E[AI or Fallback Summary]
+    E --> F[Mark Completed]
+
+    B -->|Timeout| G[Retry with Backoff]
+    G --> A
+
+    B -->|Rate Limit| H[Wait Longer]
+    H --> A
+
+    B -->|Invalid Response| I[Save to Dead Letter]
+    E -->|OpenAI Error| J[Create Fallback Summary]
+    J --> K[Log Error to Dead Letter]
+    J --> F
