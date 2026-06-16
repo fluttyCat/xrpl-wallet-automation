@@ -3,6 +3,7 @@ import csv
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -40,6 +41,11 @@ XRPL_LIMIT = int(os.getenv("XRPL_LIMIT", "50"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
+# A single XRPL ledger closes every ~3-5s; submit_and_wait should return within
+# ~16-20s for a healthy network. We give it generous headroom but refuse to
+# wait forever, so an unhealthy node can't hang the whole pipeline.
+SUBMIT_AND_WAIT_TIMEOUT_SECONDS = int(os.getenv("XRPL_SUBMIT_TIMEOUT", "45"))
+
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -48,6 +54,38 @@ HISTORY_CSV = OUTPUT_DIR / "transaction_history.csv"
 PAYMENTS_CSV = OUTPUT_DIR / "payment_flows.csv"
 MONITOR_CSV = OUTPUT_DIR / "processed_transactions.csv"
 DEAD_LETTER_CSV = OUTPUT_DIR / "dead_letter.csv"
+SEEN_HASHES_FILE = OUTPUT_DIR / "seen_tx_hashes.txt"
+
+
+def load_seen_hashes() -> set:
+    """Read previously-processed transaction hashes so we never process one twice."""
+    if not SEEN_HASHES_FILE.exists():
+        return set()
+    with SEEN_HASHES_FILE.open("r", encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def mark_hash_seen(tx_hash: str) -> None:
+    """Append a transaction hash to the seen-set on disk."""
+    if not tx_hash:
+        return
+    with SEEN_HASHES_FILE.open("a", encoding="utf-8") as f:
+        f.write(tx_hash + "\n")
+
+
+def is_validated(value: Any) -> bool:
+    """Strictly decide whether the XRPL response says this tx is validated.
+
+    XRPL returns a real boolean `True` for validated transactions, but some
+    responses omit the field (we default it to "") or return strings. We treat
+    only an explicit truthy boolean / "true" / "True" as validated, so unknown
+    or missing values fail closed.
+    """
+    if value is True:
+        return True
+    if isinstance(value, str) and value.strip().lower() == "true":
+        return True
+    return False
 
 
 def now_iso() -> str:
@@ -120,7 +158,17 @@ def rpc_request(method: str, params: List[Dict[str, Any]], retries: int = 3, tim
 
 
 def drops_to_xrp(drops: Any) -> float:
-    return int(drops) / 1_000_000
+    """Convert XRPL drops to XRP. Always returns a float; never raises.
+
+    Bad input (None, malformed strings, unexpected types) returns 0.0 and is
+    logged to the dead-letter CSV so data-quality issues are auditable instead
+    of silently swallowed.
+    """
+    try:
+        return int(drops) / 1_000_000
+    except (TypeError, ValueError):
+        dead_letter("drops_to_xrp", f"Could not convert drops to XRP: {drops!r}", {"drops": str(drops)})
+        return 0.0
 
 
 def get_balance(account: str) -> Dict[str, Any]:
@@ -233,12 +281,31 @@ def create_local_summary(row: Dict[str, Any]) -> str:
     )
 
 
-def create_ai_summary(row: Dict[str, Any]) -> str:
+_openai_client: Optional[Any] = None
+
+
+def get_openai_client() -> Optional[Any]:
+    """Lazily build a single OpenAI client and reuse it for every call.
+
+    Avoids reconstructing the HTTP/TLS connection pool on each transaction.
+    Returns None if OpenAI is unavailable, which signals the caller to fall
+    back to the local summary.
+    """
+    global _openai_client
+    if _openai_client is not None:
+        return _openai_client
     if not OPENAI_API_KEY or OpenAI is None:
+        return None
+    _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    return _openai_client
+
+
+def create_ai_summary(row: Dict[str, Any]) -> str:
+    client = get_openai_client()
+    if client is None:
         return create_local_summary(row)
 
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
         prompt = f"""
 Create a short operations review note for this XRP Ledger transaction.
 Do not claim fraud. Only mention practical checks.
@@ -260,23 +327,34 @@ Next Action:
 
 
 def monitor_payments(account: str, limit: int = XRPL_LIMIT) -> List[Dict[str, Any]]:
-    """Feature 4: AI-assisted monitoring for successful Payment transactions."""
+    """Feature 4: AI-assisted monitoring for successful Payment transactions.
+
+    Deduplicates against `seen_tx_hashes.txt` so re-runs never reprocess
+    or double-write the same transaction.
+    """
     rows = fetch_transaction_history(account, limit=limit)
+    seen = load_seen_hashes()
     processed = []
+    skipped_duplicates = 0
 
     for row in rows:
         if row["type"] != "Payment":
             continue
-        if row["validated"] is False:
+        if not is_validated(row["validated"]):
             continue
         if row["result"] and row["result"] != "tesSUCCESS":
+            continue
+
+        tx_hash = row["tx_hash"]
+        if tx_hash and tx_hash in seen:
+            skipped_duplicates += 1
             continue
 
         summary = create_ai_summary(row)
 
         processed_row = {
             "processed_at": now_iso(),
-            "tx_hash": row["tx_hash"],
+            "tx_hash": tx_hash,
             "sender": row["sender"],
             "receiver": row["receiver"],
             "amount": row["amount"],
@@ -302,13 +380,25 @@ def monitor_payments(account: str, limit: int = XRPL_LIMIT) -> List[Dict[str, An
             processed_row,
         )
 
+        mark_hash_seen(tx_hash)
+        seen.add(tx_hash)
         processed.append(processed_row)
+
+    if skipped_duplicates:
+        print(f"Skipped {skipped_duplicates} already-processed transaction(s).")
 
     return processed
 
 
 def send_payment(receiver: str, amount_xrp: float) -> Dict[str, Any]:
-    """Feature 3: payment flow using local signing and submit_and_wait."""
+    """Feature 3: payment flow using local signing and submit_and_wait.
+
+    Bounded wall-clock wait: if the network is degraded and the transaction
+    isn't validated within SUBMIT_AND_WAIT_TIMEOUT_SECONDS, we surface the
+    failure to the dead-letter log and raise instead of hanging forever.
+    `autofill` also sets LastLedgerSequence on the transaction, so the
+    network itself will drop it after ~4 ledger closes.
+    """
     if JsonRpcClient is None:
         raise RuntimeError("xrpl-py is not installed. Run: pip install xrpl-py")
 
@@ -326,7 +416,29 @@ def send_payment(receiver: str, amount_xrp: float) -> Dict[str, Any]:
 
     prepared = autofill(payment, client)
     signed = sign(prepared, wallet)
-    result = submit_and_wait(signed, client)
+
+    tx_hash = getattr(signed, "get_hash", lambda: "")()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(submit_and_wait, signed, client)
+        try:
+            result = future.result(timeout=SUBMIT_AND_WAIT_TIMEOUT_SECONDS)
+        except FuturesTimeoutError:
+            dead_letter(
+                "submit_and_wait_timeout",
+                f"Transaction did not validate within {SUBMIT_AND_WAIT_TIMEOUT_SECONDS}s",
+                {
+                    "from_account": wallet.classic_address,
+                    "to_account": receiver,
+                    "amount_xrp": amount_xrp,
+                    "tx_hash": tx_hash,
+                },
+            )
+            raise RuntimeError(
+                f"submit_and_wait timed out after {SUBMIT_AND_WAIT_TIMEOUT_SECONDS}s. "
+                f"Transaction may still be picked up by the network "
+                f"(LastLedgerSequence guard active). Hash: {tx_hash}"
+            )
 
     response_result = result.result
     meta = response_result.get("meta", {})
